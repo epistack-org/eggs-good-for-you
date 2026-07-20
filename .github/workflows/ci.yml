@@ -1,0 +1,80 @@
+# Per-repo CI for a self-contained cairn case bundle.
+#
+# Proves this case green ENTIRELY from its own bytes — independent of the engine
+# repo and of any corpus. The engine is a *tool* CI installs to run the checks;
+# the case content depends on it only through the versioned `engine.pin`
+# contract, never as code.
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  # The engine this case is verified with. An immutable tag (= reproducible).
+  # Bump only when the engine contract this case pins (engine.pin) advances.
+  ENGINE_REPO: https://github.com/epistack-org/cairn.git
+  ENGINE_REF: engine-v0.0.1
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install the cairn engine (editable, so its schemas resolve)
+        run: |
+          set -euo pipefail
+          rm -rf .ci-tmp && mkdir -p .ci-tmp
+          git clone --filter=blob:none -q "$ENGINE_REPO" .ci-tmp/engine
+          git -C .ci-tmp/engine checkout -q "$ENGINE_REF"
+          python3 -m venv .ci-tmp/venv
+          .ci-tmp/venv/bin/pip install -q --disable-pip-version-check -e .ci-tmp/engine jsonschema
+          echo "engine at $(git -C .ci-tmp/engine rev-parse --short HEAD)"
+
+      - name: schema — CASE.json is a valid cairn-case/1.0 manifest
+        run: |
+          set -euo pipefail
+          .ci-tmp/venv/bin/python - <<'PY'
+          import json, sys
+          from jsonschema import Draft202012Validator
+          schema = json.load(open(".ci-tmp/engine/schemas/case.schema.json"))
+          manifest = json.load(open("CASE.json"))
+          errs = [e.message for e in Draft202012Validator(schema).iter_errors(manifest)]
+          if errs:
+              print("CASE.json schema errors:", errs); sys.exit(1)
+          print("CASE.json valid")
+          PY
+
+      - name: structure — the case's declared verdicts hold under the engine
+        run: .ci-tmp/venv/bin/cairn cases verify .
+
+      - name: integrity — every record's id re-derives from its own content
+        run: |
+          set -euo pipefail
+          for f in records/*.json; do
+            .ci-tmp/venv/bin/cairn validate "$f" >/dev/null || { echo "INTEGRITY FAIL: $f"; exit 1; }
+          done
+          echo "all records self-verify"
+
+      - name: digest — recompute the bundle content-digest and pin it against expected.digest
+        run: |
+          set -euo pipefail
+          got=$(.ci-tmp/venv/bin/python -c "from cairn import cases; print(cases.bundle_digest('.'))")
+          exp=$(cat expected.digest)
+          echo "digest: $got"
+          if [ "$got" != "$exp" ]; then
+            echo "DIGEST DRIFT — content changed but expected.digest was not updated:"
+            echo "  expected: $exp"; echo "  actual:   $got"
+            exit 1
+          fi
+          echo "digest matches expected.digest"
+
+      - name: cleanup
+        if: always()
+        run: rm -rf .ci-tmp
